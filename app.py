@@ -19,8 +19,11 @@ import streamlit as st
 from src.compare_outputs import (
     Thresholds, apply_flags, compare, filter_records, overview_metrics,
 )
-from src.qa_checks import run_all_checks
+from src.qa_checks import REQUIRED_COLUMNS, run_all_checks
 from src.report_utils import build_review_report
+from src.agent_orchestrator import (
+    format_agent_summary_markdown, run_agentic_qa_workflow,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -137,8 +140,9 @@ st.divider()
 
 # --- Tabbed views ------------------------------------------------------------
 
-tab_qa, tab_compare, tab_charts, tab_report = st.tabs(
-    ["Deterministic QA", "Record comparison", "Charts", "Review report"]
+tab_qa, tab_compare, tab_charts, tab_report, tab_agents = st.tabs(
+    ["Deterministic QA", "Record comparison", "Charts", "Review report",
+     "Agent-Like QA Workflow"]
 )
 
 
@@ -269,3 +273,95 @@ with tab_report:
 
     st.download_button("Download markdown_review_report.md", report_md.encode("utf-8"),
                        file_name="markdown_review_report.md", mime="text/markdown")
+
+
+# --- Agent-like QA workflow tab ---------------------------------------------
+
+with tab_agents:
+    st.subheader("Agent-Like QA Workflow")
+    st.info(
+        "This is a deterministic agent-like QA workflow. It does not use an LLM "
+        "API and does not make autonomous decisions. Each agent runs a specific "
+        "review check; the final review remains human-owned."
+    )
+
+    scenarios_list = (
+        sorted(current_df["scenario"].dropna().unique())
+        if "scenario" in current_df.columns else None
+    )
+
+    workflow = run_agentic_qa_workflow(
+        prior_df=prior_df,
+        current_df=current_df,
+        comparison_df=merged,
+        required_columns=REQUIRED_COLUMNS,
+        important_columns=("pd_score", "expected_loss", "risk_grade", "scenario"),
+        key_columns=("entity_id", "scenario"),
+        pd_threshold=pd_threshold,
+        expected_loss_threshold=el_threshold,
+        valid_scenarios=scenarios_list,
+    )
+
+    overall = workflow["overall_status"]
+    if overall == "fail":
+        st.error(f"Overall agent QA status: FAIL")
+    elif overall == "warning":
+        st.warning(f"Overall agent QA status: WARNING")
+    else:
+        st.success(f"Overall agent QA status: PASS")
+    st.caption(
+        "Rule: `fail` if any agent fails; otherwise `warning` if any agent warns; "
+        "otherwise `pass`. HumanReviewAgent is excluded from the rollup."
+    )
+
+    st.markdown("### Agent status")
+    status_rows = [
+        {
+            "agent": r["agent_name"],
+            "status": r["status"],
+            "human_review_required": r["human_review_required"],
+            "findings": len(r["findings"]),
+        }
+        for r in workflow["agent_results"]
+    ]
+    st.dataframe(pd.DataFrame(status_rows), use_container_width=True)
+
+    st.markdown("### Priority findings")
+    if workflow["priority_findings"]:
+        for item in workflow["priority_findings"]:
+            st.markdown(f"- {item}")
+    else:
+        st.write("_No fail or warning findings raised._")
+
+    st.markdown("### Per-agent detail")
+    for r in workflow["agent_results"]:
+        with st.expander(f"{r['agent_name']} — {r['status'].upper()}"):
+            if r["findings"]:
+                for f in r["findings"]:
+                    st.markdown(f"- {f}")
+            else:
+                st.write("_(no findings)_")
+            if r["summary"]:
+                st.json(r["summary"], expanded=False)
+
+    st.markdown("### Human reviewer checklist")
+    st.caption(
+        "The workflow supports review. It does not approve, reject, or validate "
+        "model methodology."
+    )
+    for item in workflow["checklist"]:
+        st.checkbox(item, key=f"agent_checklist_{hash(item) & 0xFFFFFFFF}")
+
+    st.markdown("### Download")
+    agent_md = format_agent_summary_markdown(
+        workflow["agent_results"],
+        workflow["overall_status"],
+        workflow["priority_findings"],
+        workflow["checklist"],
+    )
+    st.download_button(
+        "Download agent_review_summary.md",
+        agent_md.encode("utf-8"),
+        file_name="agent_review_summary.md",
+        mime="text/markdown",
+    )
